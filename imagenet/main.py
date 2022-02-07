@@ -18,6 +18,9 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+from csam import ConvAttnWrapper
+from resnet import resnet18
+from utils import read_yaml, save_yaml, name_model
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -74,6 +77,9 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
+parser.add_argument('-variant_config_path', type=str,
+                    default='configs/convattn.yaml',
+                    help='path to variant configuration')
 
 best_acc1 = 0
 
@@ -132,10 +138,23 @@ def main_worker(gpu, ngpus_per_node, args):
     # create model
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
-        model = models.__dict__[args.arch](pretrained=True)
+        backbone = resnet(pretrained=True)#models.__dict__[args.arch](pretrained=True)
     else:
         print("=> creating model '{}'".format(args.arch))
-        model = models.__dict__[args.arch]()
+        # backbone = models.__dict__[args.arch]()
+        backbone = resnet18()
+    
+
+    variant_config = read_yaml(args.variant_config_path)
+    model = ConvAttnWrapper(backbone=backbone, variant_kwargs=variant_config)
+
+    save_dir = '/srv/share4/gstoica/checkpoints/ImageNet/{}'.format(args.arch)
+    os.makedirs(save_dir, exist_ok=True)
+    model_name = name_model(variant_config)
+    # if args.naming_suffix != '':
+    #     model_name += '_{}'.format(args.naming_suffix)
+    save_dir = os.path.join(save_dir, model_name)
+    print('Saving to: {}'.format(save_dir))
 
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
@@ -260,7 +279,8 @@ def main_worker(gpu, ngpus_per_node, args):
                 'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
-            }, is_best)
+            }, is_best,
+            save_dir=save_dir)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -353,10 +373,14 @@ def validate(val_loader, model, criterion, args):
     return top1.avg
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+def save_checkpoint(state, is_best, save_dir='/srv/share4/gstoica3/checkpoints/resnet18', filename='checkpoint.pth.tar'):
+    filename = os.path.join(save_dir, filename)
+    best_path = os.path.join(save_dir, 'model_best.pth.tar')
     torch.save(state, filename)
     if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
+        shutil.copyfile(filename, best_path)
+        print('Saving Best to : {}'.format(best_path))
+    print('Saving checkpoint to: {}'.format(filename))
 
 class Summary(Enum):
     NONE = 0
