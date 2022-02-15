@@ -5,6 +5,7 @@ import shutil
 import time
 import warnings
 from enum import Enum
+from ast import parse, literal_eval
 
 import torch
 import torch.nn as nn
@@ -80,9 +81,17 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 parser.add_argument('-variant_config_path', type=str,
                     default='configs/convattn.yaml',
                     help='path to variant configuration')
+# Redundant with convattn.yaml
+parser.add_argument('--approach_name', help='name of the approach: "1", "2", "3", "4". Look at csam.py for full documentation about each of the methods.')
+parser.add_argument('--pos_emb_dim', help='Dimension of position embedding')
+parser.add_argument('--softmax_temp', help='Softmax Temperature')
+parser.add_argument('--injection_info', help='[[InjectionLayer, NumStack, FilterSize], [...]]')
+parser.add_argument('--stride', help='Size of the stride')
+parser.add_argument('--apply_stochastic_stride', action='store_true', default=None, help='Apply stochastic stride')
+parser.add_argument('--use_residual_connection', action='store_true', default=None, help='Use residual connection')
 
 best_acc1 = 0
-
+best_acc5_at_acc1 = 0
 
 def main():
     args = parser.parse_args()
@@ -144,11 +153,27 @@ def main_worker(gpu, ngpus_per_node, args):
         # backbone = models.__dict__[args.arch]()
         backbone = resnet18()
     
-
     variant_config = read_yaml(args.variant_config_path)
+
+    # Overwrite all file configs with the ones set inline
+    if args.approach_name is not None:
+        variant_config["approach_name"] = args.approach_name
+    if args.pos_emb_dim is not None:
+        variant_config["pos_emb_dim"] = int(args.pos_emb_dim)
+    if args.softmax_temp is not None:
+        variant_config["softmax_temp"] = float(args.softmax_temp)
+    if args.injection_info is not None:
+        variant_config["injection_info"] = literal_eval(args.injection_info)
+    if args.stride is not None:
+        variant_config["stride"] = int(args.stride)
+    if args.apply_stochastic_stride is not None:
+        variant_config["apply_stochastic_stride"] = args.apply_stochastic_stride
+    if args.use_residual_connection is not None:
+        variant_config["use_residual_connection"] = args.use_residual_connection
+    
     model = ConvAttnWrapper(backbone=backbone, variant_kwargs=variant_config)
 
-    save_dir = '/srv/share4/gstoica/checkpoints/ImageNet/{}'.format(args.arch)
+    save_dir = os.path.join('/srv/share4/gstoica/checkpoints/ImageNet', args.arch, variant_config["approach_name"])
     os.makedirs(save_dir, exist_ok=True)
     model_name = name_model(variant_config)
     # if args.naming_suffix != '':
@@ -255,7 +280,7 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.evaluate:
         validate(val_loader, model, criterion, args)
         return
-
+    best_epoch = 0
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
@@ -265,11 +290,13 @@ def main_worker(gpu, ngpus_per_node, args):
         train(train_loader, model, criterion, optimizer, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        acc1, acc5 = validate(val_loader, model, criterion, args)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
+        best_acc5_at_acc1 = acc5
+        if is_best: best_epoch = epoch
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank % ngpus_per_node == 0):
@@ -281,6 +308,9 @@ def main_worker(gpu, ngpus_per_node, args):
                 'optimizer' : optimizer.state_dict(),
             }, is_best,
             save_dir=save_dir)
+        print('Best | Epoch: {} | Top-1 Accuracy: {:6.2f} | Top-5 Accuracy {:6.2f}'.format(
+            best_epoch, best_acc1, best_acc5_at_acc1)
+        )
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -370,10 +400,11 @@ def validate(val_loader, model, criterion, args):
 
         progress.display_summary()
 
-    return top1.avg
+    return top1.avg, top5.avg
 
 
 def save_checkpoint(state, is_best, save_dir='/srv/share4/gstoica3/checkpoints/resnet18', filename='checkpoint.pth.tar'):
+    os.makedirs(save_dir, exist_ok=True)
     filename = os.path.join(save_dir, filename)
     best_path = os.path.join(save_dir, 'model_best.pth.tar')
     torch.save(state, filename)
